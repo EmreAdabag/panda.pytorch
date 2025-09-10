@@ -1,0 +1,3 @@
+[submodule "mpc.pytorch"]
+	path = mpc.pytorch
+	url = git@github.com:locuslab/mpc.pytorch.git

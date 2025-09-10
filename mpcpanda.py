@@ -1,0 +1,315 @@
+import torch
+import numpy as np
+import pybullet as p
+import pybullet_data
+import sys
+import os
+import time
+import numpy as np
+import os
+import pinocchio as pin
+import pinocchio.rpy as rpy
+from scipy.spatial.transform import Rotation as R
+import importlib
+import importlib.util
+
+# Add paths
+sys.path.insert(0, 'mpc.pytorch')
+from mpc.mpc import MPC, QuadCost, GradMethods
+
+class PinocchioPandaDynamics(torch.nn.Module):
+    """Pinocchio-based dynamics for fixed-base Panda with analytic Jacobians.
+
+    Uses ABA forward dynamics and computeABADerivatives for exact partials.
+    Discretization: semi-implicit Euler
+        v' = v + dt * a(q, v, u)
+        q' = integrate(q, dt * v')   (approx Jacobians treat integrate as q + dt*v')
+
+    Notes
+    - Pinocchio runs on CPU; tensors are copied to CPU for dynamics, results
+      are returned on the input device. Batch is processed in a Python loop.
+    - For speed: reuse model/data and avoid allocations where possible.
+    """
+    def __init__(self, urdf_path, dt=0.01, device=None, with_gravity=True):
+        super().__init__()
+        self.dt = float(dt)
+        self.device = torch.device(device) if device is not None else torch.device('cpu')
+
+        self.pin = pin
+
+        # Build model and data
+        self.model = self.pin.buildModelFromUrdf(urdf_path)
+        self.data = self.model.createData()
+        if with_gravity:
+            self.model.gravity.linear = np.array([0.0, 0.0, -9.81])
+        else:
+            self.model.gravity.linear = np.array([0.0, 0.0, 0.0])
+
+        # Sizes (generalized for any actuated DoF)
+        self.nq = self.model.nq
+        self.nv = self.model.nv
+
+        # Joint limits and efforts (from Pinocchio model)
+        q_lower = torch.tensor(self.model.lowerPositionLimit, dtype=torch.float64)
+        q_upper = torch.tensor(self.model.upperPositionLimit, dtype=torch.float64)
+        effort_limit = torch.tensor(self.model.effortLimit, dtype=torch.float64)
+        self.register_buffer('q_lower', q_lower.to(self.device))
+        self.register_buffer('q_upper', q_upper.to(self.device))
+        self.register_buffer('effort_limit', effort_limit.to(self.device))
+
+    def _to_numpy(self, t):
+        return t.detach().cpu().numpy()
+
+    def _forward_single(self, q_np, v_np, u_np):
+        pin = self.pin
+        # Compute forward dynamics and semi-implicit integration
+        a = pin.aba(self.model, self.data, q_np, v_np, u_np)  # shape (7,)
+        v_next = v_np + self.dt * a
+        # Simple explicit Euler for configuration update
+        q_next = q_np + self.dt * v_next
+        return q_next, v_next
+
+    def forward(self, x, u):
+        # x: [B, 2*n], u: [B, n]
+        B = x.shape[0]
+        dev = x.device
+        dtype = x.dtype
+
+        n = self.nv
+        q = x[:, :n]
+        v = x[:, n:]
+        # No clamping for minimal implementation
+
+        q_next_list = []
+        v_next_list = []
+        for i in range(B):
+            q_np = self._to_numpy(q[i]).astype(np.float64)
+            v_np = self._to_numpy(v[i]).astype(np.float64)
+            u_np = self._to_numpy(u[i]).astype(np.float64)
+            qn, vn = self._forward_single(q_np, v_np, u_np)
+            q_next_list.append(torch.from_numpy(np.asarray(qn)).to(device=dev, dtype=dtype))
+            v_next_list.append(torch.from_numpy(np.asarray(vn)).to(device=dev, dtype=dtype))
+
+        q_next = torch.stack(q_next_list, dim=0)
+        v_next = torch.stack(v_next_list, dim=0)
+        return torch.cat([q_next, v_next], dim=-1)
+
+    @torch.no_grad()
+    def grad_input(self, x, u):
+        # Returns R, S with shapes [B,2n,2n] and [B,2n,n]
+        B = x.shape[0]
+        dev = x.device
+        dtype = x.dtype
+        dt = self.dt
+
+        pin = self.pin
+        n = self.nv
+        In = torch.eye(n, device=dev, dtype=dtype).expand(B, n, n)
+
+        # Prepare outputs
+        R = torch.zeros(B, 2*n, 2*n, device=dev, dtype=dtype)
+        S = torch.zeros(B, 2*n, n, device=dev, dtype=dtype)
+
+        q = x[:, :n]
+        v = x[:, n:]
+
+        for i in range(B):
+            q_np = self._to_numpy(q[i]).astype(np.float64)
+            v_np = self._to_numpy(v[i]).astype(np.float64)
+            u_np = self._to_numpy(u[i]).astype(np.float64)
+
+            # Compute derivatives of acceleration: dadq, dadv, dadu in R^{n x n}
+            d_dq, d_dv, d_du = pin.computeABADerivatives(self.model, self.data, q_np, v_np, u_np)
+            # Convert to torch
+            dadq = torch.from_numpy(np.asarray(d_dq)).to(device=dev, dtype=dtype)
+            dadv = torch.from_numpy(np.asarray(d_dv)).to(device=dev, dtype=dtype)
+            dadu = torch.from_numpy(np.asarray(d_du)).to(device=dev, dtype=dtype)
+
+            # Semi-implicit Euler discrete-time Jacobians
+            # v' = v + dt*a  => dv'/dq = dt*dadq, dv'/dv = I + dt*dadv, dv'/du = dt*dadu
+            R22 = In[i] + dt * dadv
+            R21 = dt * dadq
+            S_bot = dt * dadu
+
+            # Explicit Euler for position: q' = q + dt*v'
+            R11 = In[i] + dt * R21
+            R12 = dt * R22
+            S_top = dt * S_bot
+
+            # Assemble into R and S
+            # Top rows correspond to q'
+            R[i, 0:n, 0:n] = R11
+            R[i, 0:n, n:2*n] = R12
+            # Bottom rows correspond to v'
+            R[i, n:2*n, 0:n] = R21
+            R[i, n:2*n, n:2*n] = R22
+
+            S[i, 0:n, :] = S_top
+            S[i, n:2*n, :] = S_bot
+
+        return R, S
+
+
+class EETrackingCostFn(torch.autograd.Function):
+    """Custom autograd for assembling quadratic cost C, c.
+
+    Provides gradients w.r.t. ee_goal_pos and weights. Gradients for q are
+    not provided (treated as constant here). Orientation gradient w.r.t.
+    ee_goal_R is not implemented analytically in this version.
+    """
+
+    @staticmethod
+    def forward(ctx, q, ee_goal_pos, ee_goal_R, pos_weight, orient_weight, v_weight, u_weight,
+                dynamics, ee_frame_id, n_state, n_ctrl):
+        device = q.device
+        dtype = q.dtype
+
+        # Kinematics/Jacobians via Pinocchio at the given q
+        q_np = q.detach().cpu().numpy().astype(np.float64)
+        dynamics.pin.forwardKinematics(dynamics.model, dynamics.data, q_np)
+        pin.updateFramePlacements(dynamics.model, dynamics.data)
+        fk = dynamics.data.oMf[ee_frame_id]
+        p_cur = torch.from_numpy(np.asarray(fk.translation)).to(device=device, dtype=dtype)
+        R_cur = np.asarray(fk.rotation)
+
+        e_pos = p_cur - ee_goal_pos
+        R_err = ee_goal_R.detach().cpu().numpy() @ R_cur.T
+        e_rot_np = pin.log3(R_err)
+        e_rot = torch.from_numpy(np.asarray(e_rot_np)).to(device=device, dtype=dtype)
+
+        J6 = pin.computeFrameJacobian(
+            dynamics.model,
+            dynamics.data,
+            q_np,
+            ee_frame_id,
+            pin.ReferenceFrame.WORLD,
+        )
+        J_pos = torch.from_numpy(np.asarray(J6[:3, :])).to(device=device, dtype=dtype)
+        J_rot = torch.from_numpy(np.asarray(J6[3:6, :])).to(device=device, dtype=dtype)
+
+        # Quadratic terms
+        n = n_ctrl
+        Qq = pos_weight * (J_pos.T @ J_pos) + orient_weight * (J_rot.T @ J_rot)
+        pq = pos_weight * (J_pos.T @ e_pos) - orient_weight * (J_rot.T @ e_rot)
+        pq = pq - Qq @ q
+
+        C = torch.zeros(n_state + n_ctrl, n_state + n_ctrl, device=device, dtype=dtype)
+        C[0:n, 0:n] = Qq
+        C[n:2*n, n:2*n] = v_weight * torch.eye(n, device=device, dtype=dtype)
+        C[2*n:, 2*n:] = u_weight * torch.eye(n_ctrl, device=device, dtype=dtype)
+
+        c = torch.zeros(n_state + n_ctrl, device=device, dtype=dtype)
+        c[0:n] = pq
+
+        # Save for backward
+        ctx.save_for_backward(J_pos, J_rot, e_pos, e_rot, q, ee_goal_R,
+                              torch.tensor(n_state), torch.tensor(n_ctrl),
+                              pos_weight, orient_weight, v_weight, u_weight)
+        ctx.dynamics = dynamics
+        ctx.ee_frame_id = ee_frame_id
+        return C, c
+
+    @staticmethod
+    def backward(ctx, gC, gc):
+        J_pos, J_rot, e_pos, e_rot, q, ee_goal_R, n_state_t, n_ctrl_t, pos_w, ori_w, v_w, u_w = ctx.saved_tensors
+        n_state = int(n_state_t.item())
+        n_ctrl = int(n_ctrl_t.item())
+
+        # Upstream grads slices
+        n = n_ctrl
+        gCqq = gC[0:n, 0:n]
+        gCvv = gC[n:2*n, n:2*n]
+        gCuu = gC[2*n:, 2*n:]
+        gc_q = gc[0:n]
+
+        # Gradients init
+        g_q = None  # no gradient for q
+
+        # ee_goal_pos gradient: d pq / d goal_pos = -pos_w * J_pos^T applied to gc_q
+        gee_pos = -(pos_w.item()) * (J_pos @ gc_q)
+
+        # ee_goal_R gradient via SO(3) log residual
+        # Upstream gradient on e_rot from c_q term: c_q includes (-ori_w * J_rot^T e_rot)
+        g_e = -(ori_w.item()) * (J_rot @ gc_q)  # shape (3,)
+
+        def hat(v):
+            vx, vy, vz = v[0], v[1], v[2]
+            H = torch.zeros(3, 3, dtype=v.dtype, device=v.device)
+            H[0,1] = -vz; H[0,2] =  vy
+            H[1,0] =  vz; H[1,2] = -vx
+            H[2,0] = -vy; H[2,1] =  vx
+            return H
+
+        def so3_right_jacobian_inv(phi):
+            I = torch.eye(3, dtype=phi.dtype, device=phi.device)
+            theta = torch.norm(phi)
+            eps = torch.tensor(1e-8, dtype=phi.dtype, device=phi.device)
+            H = hat(phi)
+            theta_clamped = torch.clamp(theta, min=eps)
+            # stable b term
+            half = -0.5
+            if theta.item() < 1e-5:
+                b = 1.0/12.0
+            else:
+                b = (1.0/(theta_clamped*theta_clamped) - (1.0+torch.cos(theta_clamped))/(2.0*theta_clamped*torch.sin(theta_clamped)))
+            return I + half*H + b*(H @ H)
+
+        Jr_inv = so3_right_jacobian_inv(e_rot)
+        # A = (Jr_inv)^T * g_e
+        A = Jr_inv.t() @ g_e
+        # Gee_R = 0.5 * R_des * hat(R_des^T * A)
+        R_des = ee_goal_R
+        Gee_R = 0.5 * (R_des @ hat(R_des.t() @ A))
+
+        # pos_weight gradient
+        JpTJp = J_pos.T @ J_pos
+        termC_pos = (gCqq * JpTJp).sum()
+        termc_pos = gc_q @ (J_pos.T @ e_pos - JpTJp @ q)
+        g_pos_w = termC_pos + termc_pos
+
+        # orient_weight gradient
+        JrTJr = J_rot.T @ J_rot
+        termC_ori = (gCqq * JrTJr).sum()
+        termc_ori = gc_q @ (- J_rot.T @ e_rot - JrTJr @ q)
+        g_ori_w = termC_ori + termc_ori
+
+        # v_weight gradient: only on diagonal block
+        g_v_w = torch.trace(gCvv)
+
+        # u_weight gradient: only on diagonal block
+        g_u_w = torch.trace(gCuu)
+
+        # None for dynamics-related saved constants
+        return (
+            g_q,
+            gee_pos,
+            Gee_R,
+            g_pos_w,
+            g_ori_w,
+            g_v_w,
+            g_u_w,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def make_build_ee_tracking_cost(dynamics, ee_frame_id, n_state, n_ctrl):
+    """Factory that returns a builder(q, ee_goal_pos, ee_goal_R, weights)->QuadCost.
+
+    Captures constants (dynamics, ids, sizes) so they are not passed each call.
+    """
+    def builder(q, ee_goal_pos, ee_goal_R,
+                pos_weight=5.0, orient_weight=1.0, v_weight=1e-2, u_weight=1e-9):
+        C, c = EETrackingCostFn.apply(
+            q, ee_goal_pos, ee_goal_R,
+            torch.as_tensor(pos_weight, dtype=q.dtype, device=q.device),
+            torch.as_tensor(orient_weight, dtype=q.dtype, device=q.device),
+            torch.as_tensor(v_weight, dtype=q.dtype, device=q.device),
+            torch.as_tensor(u_weight, dtype=q.dtype, device=q.device),
+            dynamics, ee_frame_id, n_state, n_ctrl,
+        )
+        return QuadCost(C, c)
+
+    return builder
