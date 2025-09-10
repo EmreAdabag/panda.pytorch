@@ -295,21 +295,90 @@ class EETrackingCostFn(torch.autograd.Function):
         )
 
 
-def make_build_ee_tracking_cost(dynamics, ee_frame_id, n_state, n_ctrl):
-    """Factory that returns a builder(q, ee_goal_pos, ee_goal_R, weights)->QuadCost.
+def build_ee_tracking_cost_runtime(
+    q: torch.Tensor,
+    T: torch.Tensor,
+    goal_timesteps: torch.Tensor,
+    goal_positions: torch.Tensor,
+    goal_rotations: torch.Tensor,
+    dynamics: PinocchioPandaDynamics,
+    pos_weight: torch.Tensor,
+    orient_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    u_weight: torch.Tensor,
+):
+    """Assemble a time-varying QuadCost for multiple goals provided at runtime.
 
-    Captures constants (dynamics, ids, sizes) so they are not passed each call.
+    All inputs must be tensors. Fails with assertions if shapes/dtypes mismatch.
+
+    Args (tensors):
+      q: [n_ctrl]
+      T: scalar long tensor (horizon)
+      goal_timesteps: [K] long tensor; horizon-relative indices, can be > T-1
+      goal_positions: [K, 3]
+      goal_rotations: [K, 3, 3]
+      pos_weight, orient_weight, v_weight, u_weight: scalar tensors
     """
-    def builder(q, ee_goal_pos, ee_goal_R,
-                pos_weight=5.0, orient_weight=1.0, v_weight=1e-2, u_weight=1e-9):
-        C, c = EETrackingCostFn.apply(
-            q, ee_goal_pos, ee_goal_R,
-            torch.as_tensor(pos_weight, dtype=q.dtype, device=q.device),
-            torch.as_tensor(orient_weight, dtype=q.dtype, device=q.device),
-            torch.as_tensor(v_weight, dtype=q.dtype, device=q.device),
-            torch.as_tensor(u_weight, dtype=q.dtype, device=q.device),
-            dynamics, ee_frame_id, n_state, n_ctrl,
-        )
-        return QuadCost(C, c)
+    assert isinstance(q, torch.Tensor) and q.ndimension() == 1
+    assert isinstance(T, torch.Tensor) and T.numel() == 1
+    assert isinstance(goal_timesteps, torch.Tensor) and goal_timesteps.ndimension() == 1
+    assert isinstance(goal_positions, torch.Tensor) and goal_positions.ndimension() == 2 and goal_positions.size(1) == 3
+    assert isinstance(goal_rotations, torch.Tensor) and goal_rotations.ndimension() == 3 and goal_rotations.size(1) == 3 and goal_rotations.size(2) == 3
+    assert goal_timesteps.size(0) == goal_positions.size(0) == goal_rotations.size(0)
 
-    return builder
+    device = q.device
+    dtype = q.dtype
+    T_int = int(T.item())
+    K = goal_timesteps.size(0)
+
+    # Infer fixed parameters from dynamics
+    ee_frame_id = dynamics.model.getFrameId("panda_hand")
+    n_ctrl = dynamics.nv
+    n_state = dynamics.nq + dynamics.nv
+
+    # Prepare weights on correct device/dtype
+    pw = pos_weight.to(device=device, dtype=dtype)
+    ow = orient_weight.to(device=device, dtype=dtype)
+    vw = v_weight.to(device=device, dtype=dtype)
+    uw = u_weight.to(device=device, dtype=dtype)
+
+    # Sort goals by timestep ascending
+    sort_idx = torch.argsort(goal_timesteps)
+    ts_sorted = goal_timesteps[sort_idx]
+    gp_sorted = goal_positions[sort_idx].to(device=device, dtype=dtype)
+    gr_sorted = goal_rotations[sort_idx].to(device=device, dtype=dtype)
+
+    # Build sequences without in-place writes to preserve autograd graph
+    n_tau = n_state + n_ctrl
+    C_list = []
+    c_list = []
+
+    # Map each horizon timestep t to the "next goal" and build via EETrackingCostFn
+    for t in range(T_int):
+        idx = None
+        for k in range(K):
+            if t <= int(ts_sorted[k].item()):
+                idx = k
+                break
+        if idx is None:
+            idx = K - 1
+
+        C_t, c_t = EETrackingCostFn.apply(
+            q,
+            gp_sorted[idx],
+            gr_sorted[idx],
+            pw,
+            ow,
+            vw,
+            uw,
+            dynamics,
+            ee_frame_id,
+            n_state,
+            n_ctrl,
+        )
+        C_list.append(C_t)
+        c_list.append(c_t)
+
+    C_seq = torch.stack(C_list, dim=0)
+    c_seq = torch.stack(c_list, dim=0)
+    return QuadCost(C_seq, c_seq)

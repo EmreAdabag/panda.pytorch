@@ -8,12 +8,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, 'mpc.pytorch'))
 
-from mpcpanda import PinocchioPandaDynamics, make_build_ee_tracking_cost
+from mpcpanda import PinocchioPandaDynamics, build_ee_tracking_cost_runtime
 from mpc.mpc import MPC, QuadCost, GradMethods
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from datetime import datetime
 
 
 def random_rotation_matrix():
@@ -28,31 +24,7 @@ def random_rotation_matrix():
 
 
 def scalar_loss_from_mpc(x_seq, u_seq):
-    # Simple smooth scalar based on MPC trajectories
-    # Use a mix to ensure dependencies on both states and controls
     return 0.5 * (x_seq.pow(2).mean() + 1e-2 * u_seq.pow(2).mean())
-
-
-def finite_diff_grad(func, param, eps=1e-6):
-    g = torch.zeros_like(param)
-    it = np.nditer(np.arange(param.numel()))
-    while not it.finished:
-        idx = int(it[0])
-        with torch.no_grad():
-            flat = param.view(-1)
-            orig = flat[idx].item()
-            flat[idx] = orig + eps
-        loss_plus = func().item()
-        with torch.no_grad():
-            flat = param.view(-1)
-            flat[idx] = orig - eps
-        loss_minus = func().item()
-        with torch.no_grad():
-            flat = param.view(-1)
-            flat[idx] = orig
-        g.view(-1)[idx] = torch.tensor((loss_plus - loss_minus) / (2.0 * eps), dtype=param.dtype, device=param.device)
-        it.iternext()
-    return g
 
 
 def main():
@@ -85,9 +57,20 @@ def main():
         n_batch=1,
     )
 
-    # EE tracking cost builder
-    ee_frame_id = dyn.model.getFrameId('panda_hand')
-    cost_builder = make_build_ee_tracking_cost(dyn, ee_frame_id, n_state, n_ctrl)
+    # Multi-goal parameters (runtime, differentiable wrt poses)
+    goal_timesteps = torch.tensor([3, 9], dtype=torch.long, device=device)  # horizon-relative
+    goal_positions = torch.tensor(
+        [
+            [0.40, 0.20, 0.50],
+            [0.55,-0.20, 0.45],
+        ], dtype=torch.float64, device=device, requires_grad=True
+    )  # [K,3]
+    goal_rotations = torch.tensor(
+        [
+            random_rotation_matrix(),
+            random_rotation_matrix(),
+        ], dtype=torch.float64, device=device, requires_grad=True
+    )  # [K,3,3]
 
     # Initial state
     torch.manual_seed(0)
@@ -96,9 +79,7 @@ def main():
     v0 = torch.zeros(n, device=device, dtype=torch.float64)
     x_init = torch.cat([q0, v0], dim=0)[None, :]  # [1, n_state]
 
-    # Parameters to differentiate
-    ee_goal_pos = torch.tensor([0.4, 0.2, 0.5], device=device, dtype=torch.float64, requires_grad=True)
-    ee_goal_R = torch.tensor(random_rotation_matrix(), device=device, dtype=torch.float64, requires_grad=True)
+    # Parameters to differentiate (weights + all goal poses)
     pos_w = torch.tensor(5.0, device=device, dtype=torch.float64, requires_grad=True)
     ori_w = torch.tensor(1.0, device=device, dtype=torch.float64, requires_grad=True)
     v_w = torch.tensor(1e-2, device=device, dtype=torch.float64, requires_grad=True)
@@ -106,10 +87,13 @@ def main():
 
     # Forward solve wrapper to keep graph
     def forward_and_loss():
-        cost = cost_builder(
+        cost = build_ee_tracking_cost_runtime(
             q=q0,
-            ee_goal_pos=ee_goal_pos,
-            ee_goal_R=ee_goal_R,
+            T=torch.tensor(T, dtype=torch.long, device=device),
+            goal_timesteps=goal_timesteps,
+            goal_positions=goal_positions,
+            goal_rotations=goal_rotations,
+            dynamics=dyn,
             pos_weight=pos_w,
             orient_weight=ori_w,
             v_weight=v_w,
@@ -118,92 +102,6 @@ def main():
         x_mpc, u_mpc, obj = mpc(x_init, cost, dyn)
         return scalar_loss_from_mpc(x_mpc, u_mpc)
 
-    # Prepare output directory for plots
-    out_dir = os.path.join(REPO_ROOT, 'tools', 'mpc_grad_plots')
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Helper: sweep and plot for scalar tensor param
-    def sweep_scalar_param(name, param, base_val, delta=1e-1, N=21, h=1e-6):
-        deltas = np.linspace(-delta, delta, N)
-        fd_vals = []
-        ag_vals = []
-        for d in deltas:
-            with torch.no_grad():
-                param.copy_(torch.tensor(base_val + d, dtype=param.dtype, device=param.device))
-            # autograd gradient at this point
-            loss = forward_and_loss()
-            g = torch.autograd.grad(loss, param, retain_graph=False, create_graph=False, allow_unused=True)
-            g_val = g[0].item() if g[0] is not None else np.nan
-            ag_vals.append(g_val)
-            # finite-difference directional derivative d/dparam via central diff
-            with torch.no_grad():
-                param.add_(h)
-            lp = forward_and_loss().item()
-            with torch.no_grad():
-                param.add_(-2*h)
-            lm = forward_and_loss().item()
-            with torch.no_grad():
-                param.add_(h)  # restore
-            fd = (lp - lm) / (2*h)
-            fd_vals.append(fd)
-        # restore
-        with torch.no_grad():
-            param.copy_(torch.tensor(base_val, dtype=param.dtype, device=param.device))
-
-        # plot
-        plt.figure(figsize=(6,4))
-        plt.plot(deltas, fd_vals, 'o', label='FD')
-        plt.plot(deltas, ag_vals, '-', label='Autograd')
-        plt.xlabel(f'{name} offset')
-        plt.ylabel(f'dL/d{name}')
-        plt.title(f'Gradient sweep: {name}')
-        plt.legend()
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        fname = os.path.join(out_dir, f'{ts}_{name}_sweep.png')
-        plt.tight_layout()
-        plt.savefig(fname, dpi=150)
-        plt.close()
-        print(f'Saved {fname}')
-
-    # Helper: sweep and plot for vector component
-    def sweep_vector_component(name, vec, idx, base_val, delta=5e-2, N=21, h=1e-6):
-        deltas = np.linspace(-delta, delta, N)
-        fd_vals = []
-        ag_vals = []
-        for d in deltas:
-            with torch.no_grad():
-                vec[idx] = base_val + d
-            loss = forward_and_loss()
-            g = torch.autograd.grad(loss, vec, retain_graph=False, create_graph=False, allow_unused=True)
-            g_val = (g[0][idx].item() if g[0] is not None else np.nan)
-            ag_vals.append(g_val)
-            with torch.no_grad():
-                vec[idx] += h
-            lp = forward_and_loss().item()
-            with torch.no_grad():
-                vec[idx] -= 2*h
-            lm = forward_and_loss().item()
-            with torch.no_grad():
-                vec[idx] += h
-            fd_vals.append((lp - lm) / (2*h))
-        with torch.no_grad():
-            vec[idx] = base_val
-
-        plt.figure(figsize=(6,4))
-        plt.plot(deltas, fd_vals, 'o', label='FD')
-        plt.plot(deltas, ag_vals, '-', label='Autograd')
-        plt.xlabel(f'{name}[{idx}] offset')
-        plt.ylabel(f'dL/d{name}[{idx}]')
-        plt.title(f'Gradient sweep: {name}[{idx}]')
-        plt.legend()
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        fname = os.path.join(out_dir, f'{ts}_{name}_{idx}_sweep.png')
-        plt.tight_layout()
-        plt.savefig(fname, dpi=150)
-        plt.close()
-        print(f'Saved {fname}')
-
-    # Helper: sweep along SO(3) axis direction and plot directional derivative
     def hat(v):
         H = torch.zeros(3, 3, dtype=v.dtype, device=v.device)
         H[0,1] = -v[2]; H[0,2] =  v[1]
@@ -211,66 +109,76 @@ def main():
         H[2,0] = -v[1]; H[2,1] =  v[0]
         return H
 
-    def sweep_rotation_axis(axis_name, axis_vec, angle_delta=5e-2, N=21, h=1e-6):
-        deltas = np.linspace(-angle_delta, angle_delta, N)
-        fd_vals = []
-        ag_vals = []
-        R_base = ee_goal_R.detach().clone()
-        for d in deltas:
+    # Console report: autograd vs finite differences
+    print("Checking gradients wrt goal_positions (central FD vs autograd):")
+    h_pos = 1e-6
+    loss = forward_and_loss()
+    g_pos = torch.autograd.grad(loss, goal_positions, retain_graph=True, create_graph=False)[0]
+    for k in range(goal_positions.size(0)):
+        for i in range(3):
+            base = goal_positions[k, i].item()
             with torch.no_grad():
-                ee_goal_R.copy_(R_base @ torch.matrix_exp(d * hat(axis_vec)))
-            # autograd directional derivative dL/dd = <dL/dR, dR/dd>
-            loss = forward_and_loss()
-            G = torch.autograd.grad(loss, ee_goal_R, retain_graph=False, create_graph=False, allow_unused=True)[0]
-            if G is None:
-                ag_vals.append(np.nan)
-            else:
-                Bi = ee_goal_R @ hat(axis_vec)
-                ag_vals.append((G * Bi).sum().item())
-            # finite diff in angle
-            with torch.no_grad():
-                ee_goal_R.copy_(R_base @ torch.matrix_exp((d + h) * hat(axis_vec)))
+                goal_positions[k, i] = base + h_pos
             lp = forward_and_loss().item()
             with torch.no_grad():
-                ee_goal_R.copy_(R_base @ torch.matrix_exp((d - h) * hat(axis_vec)))
+                goal_positions[k, i] = base - h_pos
             lm = forward_and_loss().item()
-            fd_vals.append((lp - lm) / (2*h))
-        with torch.no_grad():
-            ee_goal_R.copy_(R_base)
+            with torch.no_grad():
+                goal_positions[k, i] = base
+            fd = (lp - lm) / (2*h_pos)
+            ag = g_pos[k, i].item()
+            rel = abs(ag - fd) / (abs(fd) + 1e-12)
+            print(f"  goal_pos[{k}][{i}]: autograd={ag:.6e}  FD={fd:.6e}  rel_err={rel:.2e}")
 
-        plt.figure(figsize=(6,4))
-        plt.plot(deltas, fd_vals, 'o', label='FD')
-        plt.plot(deltas, ag_vals, '-', label='Autograd')
-        plt.xlabel(f'angle offset about {axis_name} [rad]')
-        plt.ylabel('dL/d(angle)')
-        plt.title(f'Rotation gradient sweep: {axis_name}-axis')
-        plt.legend()
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        fname = os.path.join(out_dir, f'{ts}_R_{axis_name}_sweep.png')
-        plt.tight_layout()
-        plt.savefig(fname, dpi=150)
-        plt.close()
-        print(f'Saved {fname}')
-
-    # Run sweeps and generate plots
-    # Vector ee_goal_pos components
-    for i, nm in enumerate(['x','y','z']):
-        sweep_vector_component('ee_goal_pos', ee_goal_pos, i, ee_goal_pos[i].item())
-
-    # Scalar weights
-    sweep_scalar_param('pos_w', pos_w, pos_w.item())
-    sweep_scalar_param('ori_w', ori_w, ori_w.item())
-    sweep_scalar_param('v_w', v_w, v_w.item(), delta=5e-3)
-    sweep_scalar_param('u_w', u_w, u_w.item(), delta=5e-10, h=1e-12)
-
-    # Rotation axes sweeps
+    print("\nChecking gradients wrt goal_rotations (axis-angle FD vs autograd directional):")
+    h_ang = 1e-6
     basis = [
-        ('x', torch.tensor([1.0, 0.0, 0.0], dtype=ee_goal_R.dtype, device=ee_goal_R.device)),
-        ('y', torch.tensor([0.0, 1.0, 0.0], dtype=ee_goal_R.dtype, device=ee_goal_R.device)),
-        ('z', torch.tensor([0.0, 0.0, 1.0], dtype=ee_goal_R.dtype, device=ee_goal_R.device)),
+        ('x', torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64, device=device)),
+        ('y', torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64, device=device)),
+        ('z', torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64, device=device)),
     ]
-    for axis_name, axis_vec in basis:
-        sweep_rotation_axis(axis_name, axis_vec)
+    loss = forward_and_loss()
+    g_rot = torch.autograd.grad(loss, goal_rotations, retain_graph=False, create_graph=False)[0]
+    for k in range(goal_rotations.size(0)):
+        R_base = goal_rotations[k].detach().clone()
+        for axis_name, axis_vec in basis:
+            # Autograd directional derivative dL/dtheta = <dL/dR, R*hat(axis)>
+            Bi = goal_rotations[k] @ hat(axis_vec)
+            ag = (g_rot[k] * Bi).sum().item()
+            with torch.no_grad():
+                goal_rotations[k].copy_(R_base @ torch.matrix_exp(h_ang * hat(axis_vec)))
+            lp = forward_and_loss().item()
+            with torch.no_grad():
+                goal_rotations[k].copy_(R_base @ torch.matrix_exp(-h_ang * hat(axis_vec)))
+            lm = forward_and_loss().item()
+            with torch.no_grad():
+                goal_rotations[k].copy_(R_base)
+            fd = (lp - lm) / (2*h_ang)
+            rel = abs(ag - fd) / (abs(fd) + 1e-12)
+            print(f"  goal_rot[{k}] axis {axis_name}: autograd={ag:.6e}  FD={fd:.6e}  rel_err={rel:.2e}")
+
+    # Weights gradients
+    print("\nChecking gradients wrt weights (central FD vs autograd):")
+    def check_weight(name, param, h):
+        loss = forward_and_loss()
+        ag = torch.autograd.grad(loss, param, retain_graph=False, create_graph=False)[0].item()
+        base = param.item()
+        with torch.no_grad():
+            param.copy_(torch.tensor(base + h, dtype=param.dtype, device=param.device))
+        lp = forward_and_loss().item()
+        with torch.no_grad():
+            param.copy_(torch.tensor(base - h, dtype=param.dtype, device=param.device))
+        lm = forward_and_loss().item()
+        with torch.no_grad():
+            param.copy_(torch.tensor(base, dtype=param.dtype, device=param.device))
+        fd = (lp - lm) / (2*h)
+        rel = abs(ag - fd) / (abs(fd) + 1e-12)
+        print(f"  {name}: autograd={ag:.6e}  FD={fd:.6e}  rel_err={rel:.2e}")
+
+    check_weight('pos_w', pos_w, 1e-6)
+    check_weight('ori_w', ori_w, 1e-6)
+    check_weight('v_w',  v_w,  1e-6)
+    check_weight('u_w',  u_w,  1e-12)
 
 
 if __name__ == '__main__':

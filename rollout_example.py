@@ -15,7 +15,7 @@ from scipy.spatial.transform import Rotation as R
 # Import MPC components and Panda dynamics from local mpc.py
 from mpcpanda import (
     PinocchioPandaDynamics,
-    make_build_ee_tracking_cost,
+    build_ee_tracking_cost_runtime,
     MPC,
     QuadCost,
     GradMethods,
@@ -26,6 +26,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     device = 'cpu'
     print(f'using device: {device}')
+    control_mode = 'torque'
 
     sim_timestep = 0.005
     solve_timestep = 0.01
@@ -101,28 +102,31 @@ def main():
         eps=1e-3,
         n_batch=1
     )
-    
-    # End-effector tracking setup (use frame at the hand)
-    ee_frame_name = "panda_hand"
-    ee_frame_id = dynamics.model.getFrameId(ee_frame_name)
-    ee_goal = torch.tensor([0.4, 0.2, 0.5], dtype=torch.get_default_dtype(), device=device)
-
-    ee_goal_rpy = [3.14, 0, 0.]  # roll, pitch, yaw
-    # Convert RPY -> Rotation matrix
-    rot = R.from_euler('xyz', ee_goal_rpy)   # convention: roll=x, pitch=y, yaw=z
-    ee_goal_R = torch.tensor(
-        rot.as_matrix(),
-        dtype=torch.get_default_dtype(),
-        device=device
+    # Define two goals to move from point A to point B.
+    goal_positions = torch.tensor(
+        [
+            [0.4,  0.2, 0.5],   # Goal A
+            [0.55, -0.2, 0.45], # Goal B
+        ], dtype=torch.get_default_dtype(), device=device
     )
+    ee_goal_rpy = torch.tensor([3.14, 0.0, 0.0])
+    ee_goal_rpy_2 = torch.tensor([1.87, 0.0, 0.0])
+    rot = R.from_euler('xyz', ee_goal_rpy.tolist())
+    rot2 = R.from_euler('xyz', ee_goal_rpy_2.tolist())
+    rot_mat = torch.tensor(rot.as_matrix(), dtype=torch.get_default_dtype(), device=device)
+    rot_mat_2 = torch.tensor(rot2.as_matrix(), dtype=torch.get_default_dtype(), device=device)
+    goal_rotations = torch.stack([rot_mat, rot_mat_2], dim=0)  # [K,3,3]
+
+    # Absolute timesteps at which each goal should be achieved.
+    # Example: use Goal A until step 60 (inclusive), then Goal B afterwards.
+    goal_timesteps_abs = torch.tensor([60, 120], dtype=torch.long, device=device)
 
 
     # Weights for cost terms
     v_weight = 1e-2
     u_weight = 1e-9
-    pos_weight = 5.0
-    orient_weight = 1.0
-    cost_builder = make_build_ee_tracking_cost(dynamics, ee_frame_id, n_state, n_ctrl)
+    pos_weight = 4.0
+    orient_weight = 2.0
 
     # Initial state (current robot state)
     current_q = initial_q.clone().detach()
@@ -133,35 +137,52 @@ def main():
     
     # time this mpc solve
     # MPC control loop
-    max_steps = int(os.environ.get("MPC_STEPS", "500"))
+    max_steps = int(os.environ.get("MPC_STEPS", "2000"))
     for step in range(max_steps):
         s = time.monotonic()
 
-        cost = cost_builder(
+        # Compute horizon-relative timesteps for the goals at this rollout step.
+        # The schedule uses the "next goal" rule over the horizon.
+        rel_timesteps = (goal_timesteps_abs - torch.tensor(step, dtype=torch.long, device=device))
+
+        cost = build_ee_tracking_cost_runtime(
             q=current_q,
-            ee_goal_pos=ee_goal,
-            ee_goal_R=ee_goal_R,
-            pos_weight=pos_weight,
-            orient_weight=orient_weight,
-            v_weight=v_weight,
-            u_weight=u_weight,
+            T=torch.tensor(T, dtype=torch.long, device=device),
+            goal_timesteps=rel_timesteps,
+            goal_positions=goal_positions,
+            goal_rotations=goal_rotations,
+            dynamics=dynamics,
+            pos_weight=torch.tensor(pos_weight, dtype=torch.get_default_dtype(), device=device),
+            orient_weight=torch.tensor(orient_weight, dtype=torch.get_default_dtype(), device=device),
+            v_weight=torch.tensor(v_weight, dtype=torch.get_default_dtype(), device=device),
+            u_weight=torch.tensor(u_weight, dtype=torch.get_default_dtype(), device=device),
         )
 
         # Solve MPC problem and apply next position target
         x_mpc, u_mpc, obj = mpc(x_init, cost, dynamics)
-        x_cmd = x_mpc[2,0].detach().cpu().numpy()
 
         print(f"elapsed: {time.monotonic() - s}")
-        for i in range(n):
-            p.setJointMotorControl2(
-                bodyUniqueId=robot_id,
-                jointIndex=i,
-                controlMode=p.POSITION_CONTROL,
-                targetPosition=float(x_cmd[i].item()),
-                positionGain=0.05,
-                velocityGain=1.0,
-                force=float(effort_limits[i])
-            )
+        if control_mode == "torque":
+            u_cmd = u_mpc[0, 0].detach().cpu().numpy()
+            for i in range(n):
+                p.setJointMotorControl2(
+                    robot_id,
+                    i,
+                    controlMode=p.TORQUE_CONTROL,
+                    force=float(u_cmd[i])
+                )
+        else:
+            x_cmd = x_mpc[4,0].detach().cpu().numpy()
+            for i in range(n):
+                p.setJointMotorControl2(
+                    bodyUniqueId=robot_id,
+                    jointIndex=i,
+                    controlMode=p.POSITION_CONTROL,
+                    targetPosition=float(x_cmd[i].item()),
+                    positionGain=0.05,
+                    velocityGain=1.0,
+                    force=float(effort_limits[i])
+                )
         
         # Step simulation
         n_substeps = int(solve_timestep / sim_timestep)
