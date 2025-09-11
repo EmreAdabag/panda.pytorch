@@ -14,10 +14,7 @@ from scipy.spatial.transform import Rotation as R
 
 # Import MPC components and Panda dynamics from local mpc.py
 from mpcpanda import (
-    PinocchioPandaDynamics,
-    build_ee_tracking_cost_runtime,
-    MPC,
-    QuadCost,
+    PandaEETrackingMPCLayer,
     GradMethods,
 )
 
@@ -48,16 +45,21 @@ def main():
     # Base initial configuration for the first 7 joints; extra DoF will be zeroed
     base_initial_q7 = [0.0, -0.8, 0.0, -np.pi / 2, 0.0, 0.5, np.pi / 4]
     
-    # Create Pinocchio-based dynamics model with analytic Jacobians
-    dynamics = PinocchioPandaDynamics(
+    # Instantiate differentiable MPC layer (internally builds dynamics)
+    goal_timesteps_abs = torch.tensor([60, 120], dtype=torch.long, device=device)
+    layer = PandaEETrackingMPCLayer(
         urdf_path=urdf_path,
+        T=10,
+        goal_timesteps_abs=goal_timesteps_abs,
         dt=solve_timestep,
         device=device,
         with_gravity=True,
+        lqr_iter=1,
+        eps=1e-3,
+        verbose=0,
     ).to(device)
-    
 
-    n = dynamics.nv  # number of actuated DoF
+    n = layer.n_ctrl  # number of actuated DoF
 
     # Build initial_q of length n
     initial_q = torch.zeros(n, device=device)
@@ -81,28 +83,9 @@ def main():
         cameraTargetPosition=[0, 0, 0.5]
     )
     # Per-joint effort limits from Pinocchio dynamics
-    effort_limits = dynamics.effort_limit.detach().cpu().numpy().tolist()
+    effort_limits = layer.dynamics.effort_limit.detach().cpu().numpy().tolist()
 
-    # MPC parameters
-    n_state = dynamics.nq + dynamics.nv
-    n_ctrl = dynamics.nv
-    T = 30        # Horizon length (reduced for quick test)
-    
-    mpc = MPC(
-        n_state=n_state,
-        n_ctrl=n_ctrl,
-        T=T,
-        u_lower=None,
-        u_upper=None,
-        lqr_iter=1,
-        verbose=0,
-        grad_method=GradMethods.ANALYTIC,
-        exit_unconverged=False,  # Don't crash on convergence issues
-        detach_unconverged=False,
-        eps=1e-3,
-        n_batch=1
-    )
-    # Define two goals to move from point A to point B.
+    # Define two goals to move from point A to point B (batched K=2).
     goal_positions = torch.tensor(
         [
             [0.4,  0.2, 0.5],   # Goal A
@@ -117,23 +100,17 @@ def main():
     rot_mat_2 = torch.tensor(rot2.as_matrix(), dtype=torch.get_default_dtype(), device=device)
     goal_rotations = torch.stack([rot_mat, rot_mat_2], dim=0)  # [K,3,3]
 
-    # Absolute timesteps at which each goal should be achieved.
-    # Example: use Goal A until step 60 (inclusive), then Goal B afterwards.
-    goal_timesteps_abs = torch.tensor([60, 120], dtype=torch.long, device=device)
-
 
     # Weights for cost terms
-    v_weight = 1e-2
-    u_weight = 1e-9
-    pos_weight = 4.0
-    orient_weight = 2.0
+    v_weight = torch.tensor(1e-2, dtype=torch.get_default_dtype(), device=device)
+    u_weight = torch.tensor(1e-9, dtype=torch.get_default_dtype(), device=device)
+    pos_weight = torch.tensor(4.0, dtype=torch.get_default_dtype(), device=device)
+    orient_weight = torch.tensor(2.0, dtype=torch.get_default_dtype(), device=device)
 
     # Initial state (current robot state)
     current_q = initial_q.clone().detach()
-    current_qdot = torch.zeros(n_ctrl, device=device)
-    x_init = torch.cat([current_q, current_qdot]).unsqueeze(0)  # Add batch dimension
-    
-    # Control loop
+    current_qdot = torch.zeros(n, device=device)
+    x_init = torch.cat([current_q, current_qdot]).unsqueeze(0)  # [B=1, n_state]
     
     # time this mpc solve
     # MPC control loop
@@ -141,25 +118,20 @@ def main():
     for step in range(max_steps):
         s = time.monotonic()
 
-        # Compute horizon-relative timesteps for the goals at this rollout step.
-        # The schedule uses the "next goal" rule over the horizon.
-        rel_timesteps = (goal_timesteps_abs - torch.tensor(step, dtype=torch.long, device=device))
+        # Prepare batched goals for the layer: [B=1, K, ...]
+        gp_BK3 = goal_positions.unsqueeze(0)
+        gr_BK33 = goal_rotations.unsqueeze(0)
 
-        cost = build_ee_tracking_cost_runtime(
-            q=current_q,
-            T=torch.tensor(T, dtype=torch.long, device=device),
-            goal_timesteps=rel_timesteps,
-            goal_positions=goal_positions,
-            goal_rotations=goal_rotations,
-            dynamics=dynamics,
-            pos_weight=torch.tensor(pos_weight, dtype=torch.get_default_dtype(), device=device),
-            orient_weight=torch.tensor(orient_weight, dtype=torch.get_default_dtype(), device=device),
-            v_weight=torch.tensor(v_weight, dtype=torch.get_default_dtype(), device=device),
-            u_weight=torch.tensor(u_weight, dtype=torch.get_default_dtype(), device=device),
+        # Solve MPC via differentiable layer
+        x_mpc, u_mpc, obj = layer(
+            x_init,
+            gp_BK3,
+            gr_BK33,
+            pos_weight,
+            orient_weight,
+            v_weight,
+            u_weight,
         )
-
-        # Solve MPC problem and apply next position target
-        x_mpc, u_mpc, obj = mpc(x_init, cost, dynamics)
 
         print(f"elapsed: {time.monotonic() - s}")
         if control_mode == "torque":
@@ -188,7 +160,7 @@ def main():
         n_substeps = int(solve_timestep / sim_timestep)
         for i in range(n_substeps):
             p.stepSimulation()
-            
+            time.sleep(sim_timestep)            
         
         # Get new state
         for i in range(n):
