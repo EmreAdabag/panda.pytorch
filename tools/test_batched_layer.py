@@ -9,9 +9,10 @@ sys.path.insert(0, './')
 from mpcpanda import PandaEETrackingMPCLayer
 
 
-def make_rot(rpy):
+def make_quat(rpy):
     rot = R.from_euler('xyz', rpy.tolist())
-    return torch.tensor(rot.as_matrix(), dtype=torch.get_default_dtype())
+    # SciPy returns as [x, y, z, w]
+    return torch.tensor(rot.as_quat(), dtype=torch.get_default_dtype())
 
 
 def main():
@@ -51,17 +52,17 @@ def main():
 
     # Goals per batch and per K
     goal_positions = torch.zeros(B, K, 3, device=device)
-    goal_rotations = torch.zeros(B, K, 3, 3, device=device)
+    goal_quaternions = torch.zeros(B, K, 4, device=device)
     for b in range(B):
         for k in range(K):
             # Space out positions a bit per batch and per k
             goal_positions[b, k] = torch.tensor([0.4 + 0.05*b, 0.1*(-1)**k, 0.45 + 0.02*k], device=device)
             rpy = torch.tensor([3.14 - 0.5*k, 0.0, 0.0], device=device)
-            goal_rotations[b, k] = make_rot(rpy).to(device)
+            goal_quaternions[b, k] = make_quat(rpy).to(device)
 
     # Enable gradients on goals (they are leaves)
     goal_positions.requires_grad_()
-    goal_rotations.requires_grad_()
+    goal_quaternions.requires_grad_()
 
     # Scalar weights (enable gradient to test backprop)
     pos_w = torch.tensor(4.0, dtype=torch.get_default_dtype(), device=device, requires_grad=True)
@@ -70,14 +71,14 @@ def main():
     u_w = torch.tensor(1e-2, dtype=torch.get_default_dtype(), device=device, requires_grad=True)
 
     # Warmup pass
-    x_traj, u_traj, costs = layer(x_init, goal_positions, goal_rotations, pos_w, ori_w, v_w, u_w)
+    x_traj, u_traj, costs = layer(x_init, goal_positions, goal_quaternions, pos_w, ori_w, v_w, u_w)
     obj = (u_traj.pow(2).sum()) + (x_traj.pow(2).sum())
     obj.backward()
     print('Shapes:', x_traj.shape, u_traj.shape, costs.shape)
     # print('Gradients:')
     # print('x_init.grad', x_init.grad)
     # print('goal_position.grad', goal_positions.grad)
-    # print('goal_rotations.grad', goal_rotations.grad)
+    # print('goal_quaternions.grad', goal_quaternions.grad)
     # print('pos_w.grad:', pos_w.grad)
     # print('ori_w.grad:', ori_w.grad)
     # print('v_w.grad:', v_w.grad)
@@ -87,7 +88,7 @@ def main():
     s = time.monotonic()
     torch.cuda.synchronize()
     for _ in range(10):
-        x_traj, _, _ = layer(x_init, goal_positions, goal_rotations, pos_w, ori_w, v_w, u_w)
+        x_traj, _, _ = layer(x_init, goal_positions, goal_quaternions, pos_w, ori_w, v_w, u_w)
     torch.cuda.synchronize()
     e = time.monotonic()
     print(f"forward time: {(e - s) * 100} ms")
@@ -96,7 +97,7 @@ def main():
     s = time.monotonic()
     torch.cuda.synchronize()
     for _ in range(10):
-        x_traj, u_traj, _ = layer(x_init, goal_positions, goal_rotations, pos_w, ori_w, v_w, u_w)
+        x_traj, u_traj, _ = layer(x_init, goal_positions, goal_quaternions, pos_w, ori_w, v_w, u_w)
         obj = (u_traj.pow(2).sum()) + (x_traj.pow(2).sum())
         obj.backward()
     torch.cuda.synchronize()

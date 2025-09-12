@@ -89,16 +89,17 @@ def main():
     goal_positions = torch.tensor(
         [
             [0.4,  0.2, 0.5],   # Goal A
-            [0.55, -0.2, 0.45], # Goal B
+            [0.55, -0.2, 0.8], # Goal B
         ], dtype=torch.get_default_dtype(), device=device
     )
     ee_goal_rpy = torch.tensor([3.14, 0.0, 0.0])
     ee_goal_rpy_2 = torch.tensor([1.87, 0.0, 0.0])
     rot = R.from_euler('xyz', ee_goal_rpy.tolist())
     rot2 = R.from_euler('xyz', ee_goal_rpy_2.tolist())
-    rot_mat = torch.tensor(rot.as_matrix(), dtype=torch.get_default_dtype(), device=device)
-    rot_mat_2 = torch.tensor(rot2.as_matrix(), dtype=torch.get_default_dtype(), device=device)
-    goal_rotations = torch.stack([rot_mat, rot_mat_2], dim=0)  # [K,3,3]
+    # SciPy returns quaternions as [x, y, z, w]
+    quat = torch.tensor(rot.as_quat(), dtype=torch.get_default_dtype(), device=device)
+    quat2 = torch.tensor(rot2.as_quat(), dtype=torch.get_default_dtype(), device=device)
+    goal_quaternions = torch.stack([quat, quat2], dim=0)  # [K,4] (xyzw)
 
 
     # Weights for cost terms
@@ -120,13 +121,13 @@ def main():
 
         # Prepare batched goals for the layer: [B=1, K, ...]
         gp_BK3 = goal_positions.unsqueeze(0)
-        gr_BK33 = goal_rotations.unsqueeze(0)
+        gq_BK4 = goal_quaternions.unsqueeze(0)
 
         # Solve MPC via differentiable layer
         x_mpc, u_mpc, obj = layer(
             x_init,
             gp_BK3,
-            gr_BK33,
+            gq_BK4,
             pos_weight,
             orient_weight,
             v_weight,

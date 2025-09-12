@@ -150,6 +150,39 @@ class PinocchioPandaDynamics(torch.nn.Module):
         return R, S
 
 
+def quat_xyzw_to_matrix(quat: torch.Tensor) -> torch.Tensor:
+    """Convert quaternion(s) in xyzw to rotation matrix/matrices.
+
+    Tries PyTorch3D's `quaternion_to_matrix` (expects wxyz), otherwise uses
+    a pure-Torch implementation. Accepts shape [..., 4], returns [..., 3, 3].
+    """
+    assert quat.shape[-1] == 4
+    # Fallback: pure Torch differentiable conversion
+    q = quat / (quat.norm(dim=-1, keepdim=True) + 1e-15)
+    x, y, z, w = q.unbind(-1)
+    two = torch.tensor(2.0, dtype=q.dtype, device=q.device)
+    xx = x * x; yy = y * y; zz = z * z
+    xy = x * y; xz = x * z; yz = y * z
+    xw = x * w; yw = y * w; zw = z * w
+
+    m00 = 1 - two * (yy + zz)
+    m01 = two * (xy - zw)
+    m02 = two * (xz + yw)
+    m10 = two * (xy + zw)
+    m11 = 1 - two * (xx + zz)
+    m12 = two * (yz - xw)
+    m20 = two * (xz - yw)
+    m21 = two * (yz + xw)
+    m22 = 1 - two * (xx + yy)
+
+    M = torch.stack([
+        torch.stack([m00, m01, m02], dim=-1),
+        torch.stack([m10, m11, m12], dim=-1),
+        torch.stack([m20, m21, m22], dim=-1),
+    ], dim=-2)
+    return M
+
+
 class EETrackingCostFn(torch.autograd.Function):
     """Custom autograd for assembling quadratic cost C, c.
 
@@ -205,16 +238,15 @@ class EETrackingCostFn(torch.autograd.Function):
 
         # Save for backward
         ctx.save_for_backward(J_pos, J_rot, e_pos, e_rot, q, ee_goal_R,
-                              torch.tensor(n_state), torch.tensor(n_ctrl),
-                              pos_weight, orient_weight, v_weight, u_weight)
+                               torch.tensor(n_state), torch.tensor(n_ctrl),
+                               pos_weight, orient_weight, v_weight, u_weight)
         ctx.dynamics = dynamics
         ctx.ee_frame_id = ee_frame_id
         return C, c
 
     @staticmethod
     def backward(ctx, gC, gc):
-        J_pos, J_rot, e_pos, e_rot, q, ee_goal_R, n_state_t, n_ctrl_t, pos_w, ori_w, v_w, u_w = ctx.saved_tensors
-        n_state = int(n_state_t.item())
+        J_pos, J_rot, e_pos, e_rot, q, R_des, n_state_t, n_ctrl_t, pos_w, ori_w, v_w, u_w = ctx.saved_tensors
         n_ctrl = int(n_ctrl_t.item())
 
         # Upstream grads slices
@@ -259,8 +291,6 @@ class EETrackingCostFn(torch.autograd.Function):
         Jr_inv = so3_right_jacobian_inv(e_rot)
         # A = (Jr_inv)^T * g_e
         A = Jr_inv.t() @ g_e
-        # Gee_R = 0.5 * R_des * hat(R_des^T * A)
-        R_des = ee_goal_R
         Gee_R = 0.5 * (R_des @ hat(R_des.t() @ A))
 
         # pos_weight gradient
@@ -283,17 +313,17 @@ class EETrackingCostFn(torch.autograd.Function):
 
         # None for dynamics-related saved constants
         return (
-            g_q,
-            gee_pos,
-            Gee_R,
-            g_pos_w,
-            g_ori_w,
-            g_v_w,
-            g_u_w,
-            None,
-            None,
-            None,
-            None,
+            g_q,          # x_state
+            gee_pos,      # ee_goal_pos
+            Gee_R,          # ee_goal_R
+            g_pos_w,      # pos_weight
+            g_ori_w,      # orient_weight
+            g_v_w,        # v_weight
+            g_u_w,        # u_weight
+            None,         # dynamics
+            None,         # ee_frame_id
+            None,         # n_state
+            None,         # n_ctrl
         )
 
 
@@ -391,7 +421,7 @@ def build_ee_tracking_cost_batched_timevarying(
     T: int,
     goal_timesteps: torch.Tensor,
     goal_positions: torch.Tensor,
-    goal_rotations: torch.Tensor,
+    goal_quaternions: torch.Tensor,
     dynamics: PinocchioPandaDynamics,
     pos_weight: torch.Tensor,
     orient_weight: torch.Tensor,
@@ -409,7 +439,7 @@ def build_ee_tracking_cost_batched_timevarying(
       T: int horizon length
       goal_timesteps: [K] long tensor (horizon-relative, can exceed T-1)
       goal_positions: [B, K, 3]
-      goal_rotations: [B, K, 3, 3]
+      goal_quaternions: [B, K, 4] (xyzw)
       pos_weight, orient_weight, v_weight, u_weight: scalar or [B]
     Returns QuadCost with C: [T, B, n_tau, n_tau], c: [T, B, n_tau]
     """
@@ -429,7 +459,10 @@ def build_ee_tracking_cost_batched_timevarying(
 
     K = goal_timesteps.size(0)
     assert goal_positions.shape == (B, K, 3), "goal_positions must be [B,K,3]"
-    assert goal_rotations.shape == (B, K, 3, 3), "goal_rotations must be [B,K,3,3]"
+    assert goal_quaternions.shape == (B, K, 4), "goal_quaternions must be [B,K,4] (xyzw)"
+
+    # Convert quaternions to rotation matrices once for the whole batch
+    goal_rot_mats = quat_xyzw_to_matrix(goal_quaternions.view(-1, 4)).view(B, K, 3, 3)
 
     # Sort goal schedule indices once (shared across batch)
     sort_idx = torch.argsort(goal_timesteps)
@@ -453,7 +486,7 @@ def build_ee_tracking_cost_batched_timevarying(
             Cb, cb = EETrackingCostFn.apply(
                 x_batch[b],
                 goal_positions[b, idx],
-                goal_rotations[b, idx],
+                goal_rot_mats[b, idx],
                 pos_weight,
                 orient_weight,
                 v_weight,
@@ -486,7 +519,7 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
     Forward inputs
       x_init: [B, n_state] current state (q concatenated with dq)
       goal_positions: [B, K, 3]
-      goal_rotations: [B, K, 3, 3]
+      goal_quaternions: [B, K, 4] (xyzw)
       pos_weight, orient_weight, v_weight, u_weight: scalar tensors
 
     Returns
@@ -543,7 +576,7 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
         self,
         x_init: torch.Tensor,
         goal_positions: torch.Tensor,
-        goal_rotations: torch.Tensor,
+        goal_quaternions: torch.Tensor,
         pos_weight: torch.Tensor,
         orient_weight: torch.Tensor,
         v_weight: torch.Tensor,
@@ -566,7 +599,7 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
             T=self.T,
             goal_timesteps=rel_ts,
             goal_positions=goal_positions,
-            goal_rotations=goal_rotations,
+            goal_quaternions=goal_quaternions,
             dynamics=self.dynamics,
             pos_weight=pos_weight,
             orient_weight=orient_weight,

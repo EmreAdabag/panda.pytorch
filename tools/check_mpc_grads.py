@@ -8,19 +8,14 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, 'mpc.pytorch'))
 
-from mpcpanda import PinocchioPandaDynamics, build_ee_tracking_cost_runtime
-from mpc.mpc import MPC, QuadCost, GradMethods
+from mpcpanda import PandaEETrackingMPCLayer
+from mpc.mpc import GradMethods
 
 
-def random_rotation_matrix():
-    axis = np.random.randn(3)
-    axis = axis / (np.linalg.norm(axis) + 1e-12)
-    angle = np.random.uniform(-np.pi, np.pi)
-    K = np.array([[0, -axis[2], axis[1]],
-                  [axis[2], 0, -axis[0]],
-                  [-axis[1], axis[0], 0]])
-    R = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
-    return R
+def random_quaternion_xyzw():
+    v = np.random.randn(4)
+    v = v / (np.linalg.norm(v) + 1e-12)
+    return v
 
 
 def scalar_loss_from_mpc(x_seq, u_seq):
@@ -34,43 +29,36 @@ def main():
     # Dynamics
     urdf_path = os.path.join(REPO_ROOT, 'robot_description', 'panda_with_gripper.urdf')
     dt = 0.01
-    dyn = PinocchioPandaDynamics(urdf_path=urdf_path, dt=dt, device=device, with_gravity=True).to(device)
-
-    n = dyn.nv
-    n_state = dyn.nq + dyn.nv
-    n_ctrl = dyn.nv
-
-    # MPC setup
+    # MPC layer
     T = 10
-    mpc = MPC(
-        n_state=n_state,
-        n_ctrl=n_ctrl,
+    goal_ts_abs = torch.tensor([3, 9], dtype=torch.long, device=device)
+    layer = PandaEETrackingMPCLayer(
+        urdf_path=urdf_path,
         T=T,
-        u_lower=None,
-        u_upper=None,
+        goal_timesteps_abs=goal_ts_abs,
+        dt=dt,
+        device=device,
+        with_gravity=True,
         lqr_iter=2,
         verbose=0,
-        grad_method=GradMethods.ANALYTIC,
-        exit_unconverged=False,
-        detach_unconverged=False,
         eps=1e-3,
-        n_batch=1,
-    )
+    ).to(device)
+
+    n = layer.n_ctrl
+    n_state = layer.n_state
 
     # Multi-goal parameters (runtime, differentiable wrt poses)
-    goal_timesteps = torch.tensor([3, 9], dtype=torch.long, device=device)  # horizon-relative
     goal_positions = torch.tensor(
         [
             [0.40, 0.20, 0.50],
             [0.55,-0.20, 0.45],
         ], dtype=torch.float64, device=device, requires_grad=True
     )  # [K,3]
-    goal_rotations = torch.tensor(
-        [
-            random_rotation_matrix(),
-            random_rotation_matrix(),
-        ], dtype=torch.float64, device=device, requires_grad=True
-    )  # [K,3,3]
+    quats_np = np.stack([
+        random_quaternion_xyzw(),
+        random_quaternion_xyzw(),
+    ], axis=0)
+    goal_quaternions = torch.tensor(quats_np, dtype=torch.float64, device=device, requires_grad=True)  # [K,4]
 
     # Initial state
     torch.manual_seed(0)
@@ -87,19 +75,17 @@ def main():
 
     # Forward solve wrapper to keep graph
     def forward_and_loss():
-        cost = build_ee_tracking_cost_runtime(
-            q=q0,
-            T=torch.tensor(T, dtype=torch.long, device=device),
-            goal_timesteps=goal_timesteps,
-            goal_positions=goal_positions,
-            goal_rotations=goal_rotations,
-            dynamics=dyn,
-            pos_weight=pos_w,
-            orient_weight=ori_w,
-            v_weight=v_w,
-            u_weight=u_w,
+        # Ensure consistent goal schedule across evaluations (avoid internal step drift)
+        layer.reset_schedule(0)
+        x_mpc, u_mpc, _ = layer(
+            x_init,
+            goal_positions.unsqueeze(0),
+            goal_quaternions.unsqueeze(0),
+            pos_w,
+            ori_w,
+            v_w,
+            u_w,
         )
-        x_mpc, u_mpc, obj = mpc(x_init, cost, dyn)
         return scalar_loss_from_mpc(x_mpc, u_mpc)
 
     def hat(v):
@@ -130,7 +116,7 @@ def main():
             rel = abs(ag - fd) / (abs(fd) + 1e-12)
             print(f"  goal_pos[{k}][{i}]: autograd={ag:.6e}  FD={fd:.6e}  rel_err={rel:.2e}")
 
-    print("\nChecking gradients wrt goal_rotations (axis-angle FD vs autograd directional):")
+    print("\nChecking gradients wrt goal_quaternions (axis-angle FD vs autograd directional):")
     h_ang = 1e-6
     basis = [
         ('x', torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64, device=device)),
@@ -138,24 +124,44 @@ def main():
         ('z', torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64, device=device)),
     ]
     loss = forward_and_loss()
-    g_rot = torch.autograd.grad(loss, goal_rotations, retain_graph=False, create_graph=False)[0]
-    for k in range(goal_rotations.size(0)):
-        R_base = goal_rotations[k].detach().clone()
+    g_quat = torch.autograd.grad(loss, goal_quaternions, retain_graph=False, create_graph=False)[0]
+
+    def quat_mul(q, r):
+        x1,y1,z1,w1 = q
+        x2,y2,z2,w2 = r
+        return torch.tensor([
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        ], dtype=q.dtype, device=q.device)
+
+    for k in range(goal_quaternions.size(0)):
+        q_base = goal_quaternions[k].detach().clone()
         for axis_name, axis_vec in basis:
-            # Autograd directional derivative dL/dtheta = <dL/dR, R*hat(axis)>
-            Bi = goal_rotations[k] @ hat(axis_vec)
-            ag = (g_rot[k] * Bi).sum().item()
+            # Autograd directional derivative dL/dtheta = <dL/dq, dq/dtheta>
+            # dq/dtheta at 0 for right-mult by exp(0.5*theta*axis): 0.5 * q ⊗ [axis, 0]
+            J_dir = 0.5 * quat_mul(q_base, torch.tensor([axis_vec[0], axis_vec[1], axis_vec[2], 0.0], dtype=q_base.dtype, device=q_base.device))
+            ag = (g_quat[k] * J_dir).sum().item()
+
+            # Finite difference via small rotation quaternion on the right
+            dq = torch.tensor([
+                axis_vec[0]*np.sin(h_ang/2.0),
+                axis_vec[1]*np.sin(h_ang/2.0),
+                axis_vec[2]*np.sin(h_ang/2.0),
+                np.cos(h_ang/2.0),
+            ], dtype=q_base.dtype, device=q_base.device)
             with torch.no_grad():
-                goal_rotations[k].copy_(R_base @ torch.matrix_exp(h_ang * hat(axis_vec)))
+                goal_quaternions[k].copy_(quat_mul(q_base, dq))
             lp = forward_and_loss().item()
             with torch.no_grad():
-                goal_rotations[k].copy_(R_base @ torch.matrix_exp(-h_ang * hat(axis_vec)))
+                goal_quaternions[k].copy_(quat_mul(q_base, torch.tensor([-dq[0], -dq[1], -dq[2], dq[3]], dtype=q_base.dtype, device=q_base.device)))
             lm = forward_and_loss().item()
             with torch.no_grad():
-                goal_rotations[k].copy_(R_base)
+                goal_quaternions[k].copy_(q_base)
             fd = (lp - lm) / (2*h_ang)
             rel = abs(ag - fd) / (abs(fd) + 1e-12)
-            print(f"  goal_rot[{k}] axis {axis_name}: autograd={ag:.6e}  FD={fd:.6e}  rel_err={rel:.2e}")
+            print(f"  goal_quat[{k}] axis {axis_name}: autograd={ag:.6e}  FD={fd:.6e}  rel_err={rel:.2e}")
 
     # Weights gradients
     print("\nChecking gradients wrt weights (central FD vs autograd):")
